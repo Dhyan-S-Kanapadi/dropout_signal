@@ -40,6 +40,3 @@ Run in any notebook cell:
 03_model_training → 04_fairness_audit → 
 05_explainability_and_output
 
-## Team
-- Your name — role
-- Teammate name — role
