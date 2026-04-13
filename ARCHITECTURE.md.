@@ -1,0 +1,394 @@
+# System Architecture — Dropout Signal
+
+## Overview
+
+Dropout Signal is a five-layer early warning system built entirely 
+on Databricks. It detects student dropout risk weeks before it 
+appears in grades, explains each prediction in plain English, and 
+audits every output for demographic fairness.
+
+The system is designed for two audiences simultaneously:
+- Data teams who need a rigorous, fair, explainable ML pipeline
+- School counselors who need plain English answers about which 
+  students need help and why
+
+---
+
+## The core philosophy
+
+Most student support systems ask: is this student at risk right now?
+
+Dropout Signal asks: is this student's situation getting worse, 
+and how fast?
+
+This shift from snapshot to trajectory is what enables intervention 
+weeks before dropout becomes inevitable. By the time a static system 
+flags a student, the window for effective intervention has often 
+already closed.
+
+---
+
+## System overview
+
+Raw data sources
+      ↓
+Delta Lake storage
+      ↓
+Cleaning and feature engineering
+      ↓
+XGBoost risk scoring model
+      ↓
+Fairness audit (equalized odds)
+      ↓
+SHAP explainability
+      ↓
+Intervention output table
+      ↓
+Genie Space (plain English queries for counselors)
+
+---
+
+## Layer 1 — Data Ingestion
+
+Raw institutional data is ingested into Databricks and stored 
+as versioned Delta tables in Unity Catalog.
+
+### Data sources
+
+| Source | What it contains |
+|---|---|
+| Academic records | GPA per student per week per semester |
+| Attendance logs | Daily and weekly attendance per student |
+| Financial records | Payment status, aid status, fee waivers |
+| Engagement records | Counselor visits, club activity, library check-ins |
+
+### Storage design
+
+- All raw tables stored in Delta Lake
+- Schema enforced at ingestion time
+- Full data versioning handled automatically by Delta
+- Time travel enabled — any historical state is queryable
+
+### Why Delta Lake
+
+Delta Lake gives us ACID transactions on top of cloud storage.
+This matters because student data arrives from multiple systems 
+at different times. Delta ensures we never have a partially 
+updated table that could corrupt downstream features.
+
+---
+
+## Layer 2 — Cleaning and Feature Engineering
+
+This is the most critical layer. Most competing systems use static 
+features — current GPA, current attendance rate. We use trend 
+features that capture change over time.
+
+The insight: a student going from 3.8 to 2.8 GPA is in a 
+completely different situation from a student who has always 
+had 2.8 GPA. Static features see them as identical. 
+Trend features see the difference immediately.
+
+### Cleaning approach
+
+Every null value is classified before any action is taken:
+
+| Null type | Meaning | Treatment |
+|---|---|---|
+| Random missing | Data pipeline error | Impute with student's personal mean |
+| Structural absence | First semester, no prior data | Leave null, add is_first_semester flag |
+| Meaningful absence | Student stopped engaging | Forward fill, add imputed flag |
+| Inapplicable | Full scholarship, no financial data | Fill zero, add not_applicable flag |
+
+A parallel flag column is created for every imputed value.
+The model sees both the filled value and the fact it was filled.
+
+### Features engineered
+
+Academic trend features:
+- grade_slope_4w — linear regression slope of GPA over 4 weeks
+- grade_slope_8w — linear regression slope of GPA over 8 weeks
+- semester_grade_delta — this semester GPA minus last semester GPA
+
+Attendance trend features:
+- attendance_delta — current week rate minus student's own 8-week baseline
+- absenteeism_trend — rate of change in weekly unexcused absences
+
+Financial stress features:
+- financial_stress_index — weighted score combining payment history,
+  aid status changes, fee waiver applications, and outstanding balance
+- consecutive_late_payments — count of back-to-back late payments
+
+Engagement features:
+- engagement_recency — days since last non-academic activity
+- engagement_no_history — binary flag for students with zero records
+
+### Why personal baseline for attendance
+
+Comparing a student against the class average misses individual 
+deterioration. A student who always attends 60% and drops to 55% 
+is probably fine. A student who always attends 95% and drops to 
+70% is in serious trouble.
+
+Attendance delta is computed against each student's own history —
+not the cohort average. This catches individual decline regardless 
+of starting point and is fairer across socioeconomic groups.
+
+### The cascading signal story
+
+These features are not independent. They tell a cascading story:
+
+Financial stress hits first — a family situation changes.
+Weeks later, absenteeism rises — extra shifts, family responsibilities.
+Weeks after that, grades fall — the semester delta turns negative.
+
+A student where only the financial stress index has spiked but 
+grades and attendance are still fine is in the earliest chapter —
+where intervention has the highest chance of success.
+
+---
+
+## Layer 3 — Risk Scoring Model
+
+### Model choice
+
+Algorithm: XGBoost gradient boosted trees
+Output: continuous risk score from 0.0 to 1.0
+
+XGBoost is chosen over deep learning approaches because:
+- Handles tabular data with mixed types naturally
+- Produces well-calibrated probabilities
+- SHAP values are computationally tractable
+- Interpretable to technical stakeholders
+
+### Key design decisions
+
+Time decay weighting
+Recent observations carry higher sample weight during training.
+A grade drop last week matters more than one six months ago.
+This is enforced through sample weights, not feature engineering.
+
+Asymmetric loss function
+False negatives — missing a student who drops out — are penalized 
+3x more than false positives — flagging a student unnecessarily.
+This reflects the real-world cost asymmetry of the two error types.
+
+Temporal train-test split
+Training uses early semesters. Testing uses later semesters.
+No student's future data ever appears in their own training window.
+Standard random splits are not used — they leak future information.
+
+Calibrated probabilities
+Isotonic regression is applied post-training so that a score of 
+0.7 genuinely means approximately 70% dropout probability.
+This makes the risk score meaningful and communicable.
+
+### Experiment tracking
+
+All model runs tracked in MLflow:
+- Parameters logged per run
+- Metrics logged: AUC-PR, F1, FNR, FPR per demographic group
+- Best model registered in MLflow Model Registry
+- Artifacts stored for reproducibility
+
+---
+
+## Layer 4 — Fairness Audit
+
+Fairness is not an offline evaluation in this system. It is part 
+of the prediction pipeline. Every prediction passes through the 
+fairness audit before reaching the output table.
+
+### The problem we are solving
+
+A model trained on historical data inherits historical inequities.
+If low-income students dropped out more often in the past — not 
+because they were less capable but because they had fewer resources —
+the model learns to flag them more aggressively.
+
+This creates two simultaneous failures:
+- Low-income students get over-flagged — stigmatized, resources wasted
+- Higher-income struggling students get under-flagged — fall through cracks
+
+A single accuracy number never reveals this. Equalized odds does.
+
+### Fairness metric: equalized odds
+
+We separately compute for each demographic group:
+
+False Positive Rate — of students who did not drop out,
+what fraction did we wrongly flag as high risk?
+
+False Negative Rate — of students who did drop out,
+what fraction did we miss entirely?
+
+Equalized odds requires both FPR and FNR to be within 5% 
+tolerance across gender groups and socioeconomic bands.
+
+### Correction method
+
+When gaps exceed tolerance:
+
+Group-specific threshold adjustment — instead of one global 
+threshold for everyone, each group gets the threshold that 
+achieves the target FPR for that group.
+
+Training reweighting — underrepresented groups receive higher 
+sample weights during training so their errors cost more.
+
+### Fairness output
+
+Every student in the intervention table carries a fairness flag:
+
+Verified — prediction made under a fair, group-calibrated threshold
+Review needed — fairness gap detected for this student's group,
+manual counselor verification recommended before acting
+
+---
+
+## Layer 5 — Explainability
+
+### The problem with global explanations
+
+Standard feature importance says: attendance is the most important 
+feature overall. That is a model-level statement. It helps nobody 
+make a decision about a specific student.
+
+We use SHAP to generate per-student explanations.
+
+### How SHAP works here
+
+SHAP values are computed for every student at every prediction.
+The top 3 contributing features are extracted per student.
+Feature names are mapped to plain English reason codes.
+
+| SHAP feature | Reason shown to counselor |
+|---|---|
+| grade_slope_4w negative | Grades have been declining for 4 weeks |
+| attendance_delta below -0.2 | Attendance dropped significantly below personal baseline |
+| financial_stress_index above 0.7 | Ongoing financial pressure detected |
+| engagement_recency above 30 | No school engagement in over 30 days |
+| consecutive_late_payments above 1 | Multiple consecutive late payments |
+
+### Why this matters
+
+A counselor does not need to understand SHAP values.
+They need to understand why the system flagged this specific student 
+and what they should do about it.
+
+The translation from model internals to plain English reason codes 
+is what makes this system usable in the real world.
+
+---
+
+## Layer 6 — Genie Space
+
+### What it is
+
+Databricks Genie is the natural language interface layer of this 
+system. It allows school counselors and administrators to query 
+student risk data in plain English — no SQL, no Python, no 
+technical knowledge required.
+
+This is the layer that transforms Dropout Signal from a model 
+into a complete tool for the humans who make intervention decisions.
+
+### Connected tables
+
+| Table | What it contains |
+|---|---|
+| students_clean | Cleaned student profiles with demographic data |
+| risk_scores | Model output — scores, bands, prediction dates |
+| intervention_output | Final table with reasons and recommended actions |
+| fairness_audit | Group level FPR and FNR audit results |
+
+### Example questions counselors can ask
+
+Academic risk:
+- Show me all high risk students this week
+- Which students have had declining grades for more than 3 weeks
+- List students whose GPA dropped more than 0.5 points this semester
+
+Attendance:
+- Which students are attending 30% less than their personal baseline
+- Who has the worst attendance trend in the last 4 weeks
+- Show me students with more than 5 unexcused absences this month
+
+Financial stress:
+- Which students have a financial stress index above 0.7
+- Show me students with two or more consecutive late payments
+- List students whose financial aid status changed this semester
+
+Engagement:
+- Which students have not engaged in any activity for 30 days
+- Show me students with high risk scores and zero engagement
+- Who has both financial stress and declining attendance
+
+Intervention management:
+- How many students are in each risk band this week
+- Which high risk students have not been contacted yet
+- Show me all students assigned a counselor call this week
+- List students where the fairness flag shows a review is needed
+
+### Genie system prompt
+
+The Genie Space is configured with this instruction:
+
+You are a student risk assistant for school counselors.
+Answer questions about student dropout risk clearly and concisely.
+Always show student names, risk scores, and recommended actions.
+Flag any students where fairness verification shows a review is needed.
+Use plain English. Avoid technical jargon.
+Prioritize students with the highest risk scores in every response.
+
+### How to recreate the Genie Space
+
+1. Open Databricks workspace
+2. Click Genie in the left sidebar
+3. Click Create new Genie Space
+4. Name it: Dropout Signal — Student Risk Assistant
+5. Connect the four tables listed above
+6. Paste the system prompt above into the instructions field
+7. Save and test with the example questions
+
+---
+
+## Technology stack
+
+| Component | Technology | Purpose |
+|---|---|---|
+| Platform | Databricks Free Edition | Everything runs here |
+| Storage | Delta Lake | Versioned, ACID-compliant tables |
+| Catalog | Unity Catalog | Governed data access |
+| Processing | PySpark | Distributed data transformation |
+| Modeling | XGBoost | Risk scoring |
+| Explainability | SHAP | Per-student factor attribution |
+| Experiment tracking | MLflow | Run logging and model registry |
+| NL interface | Databricks Genie | Plain English querying for counselors |
+| Version control | GitHub via Databricks Repos | Source of truth |
+
+---
+
+## Key design principles
+
+Trend over snapshot
+We do not ask where a student is. We ask where they are going.
+Direction of change is more predictive than current level.
+
+Personal baseline over population average
+Every student is compared against their own history.
+This catches individual deterioration regardless of starting point.
+
+Fairness inside the pipeline
+Fairness audit runs before output generation.
+It is not an evaluation — it is a gate.
+
+Counselor-first output
+Every output is designed for a non-technical user.
+Risk scores paired with plain English explanations.
+Genie Space for natural language queries over live data.
+
+Early over accurate
+A prediction that is slightly less accurate but arrives 6 weeks 
+earlier is more valuable than a highly accurate prediction that 
+arrives after intervention is no longer possible.
